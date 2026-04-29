@@ -42,6 +42,13 @@ struct iso7816_source {
     SCARDHANDLE h;
     DWORD       proto;
     app_id      app;
+    /* Largest GET CHALLENGE Le the card has accepted so far. Some cards
+     * (notably some ID and transport cards) cap the challenge at well
+     * below the 255-byte short-Le maximum and reject larger requests
+     * with SW=6700 (wrong length) or SW=6Cxx. We start optimistic and
+     * halve on rejection in iso7816_read; the learned value sticks for
+     * the lifetime of the source. */
+    size_t      max_chunk;
 };
 
 int iso7816_global_init(void)
@@ -143,6 +150,20 @@ static const struct {
 static int probe_app(iso7816_source *c)
 {
     uint8_t throwaway[8];
+
+    /* Try GET CHALLENGE on the card's default selection first.
+     * SCardConnect powers the card up with the master file selected on
+     * most ISO 7816-4 implementations; plain identity / transport /
+     * insurance cards typically support GET CHALLENGE there directly,
+     * and skipping the SELECT dance avoids leaving the card in an
+     * applet-specific state when no applet matches. */
+    if (try_get_challenge(c, sizeof(throwaway), throwaway) > 0) {
+        c->app = APP_NONE;
+        return 0;
+    }
+
+    /* Fall back to applet-specific paths for tokens that don't expose
+     * GET CHALLENGE on their default applet (Yubikey CM, etc.). */
     for (size_t i = 0; i < sizeof(k_apps) / sizeof(k_apps[0]); i++) {
         int rv = select_aid(c, k_apps[i].aid, k_apps[i].aid_len);
         if (rv < 0) return -1;
@@ -152,11 +173,8 @@ static int probe_app(iso7816_source *c)
             return 0;
         }
     }
-    if (try_get_challenge(c, sizeof(throwaway), throwaway) > 0) {
-        c->app = APP_NONE;
-        return 0;
-    }
-    LOGD("card does not support GET CHALLENGE on PIV/OpenPGP/none\n");
+
+    LOGD("card does not support GET CHALLENGE on default/PIV/OpenPGP\n");
     c->app = APP_UNKNOWN;
     return -1;
 }
@@ -186,13 +204,22 @@ int iso7816_open(const char *reader, iso7816_source **out)
 
     iso7816_source *c = calloc(1, sizeof(*c));
     if (!c) return -1;
+    /* Largest power of two that fits in the APDU short-Le field. Starting
+     * here (rather than at 255) keeps subsequent halvings on power-of-two
+     * boundaries, so cards that only accept exactly 8 / 16 / 32-byte
+     * challenges converge to a working chunk instead of overshooting
+     * (255 → 127 → 63 → 31 → 15 → 7 misses 8 entirely). */
+    c->max_chunk = 128;
 
     int crv = connect_card_raw(reader, c);
-    if (crv != 0) { free(c); return crv > 0 ? -2 : -1; }
+    if (crv != 0) {
+        free(c);
+        return crv > 0 ? -2 : -1;     /* -2 = empty reader, -1 = error */
+    }
     if (probe_app(c) < 0) {
         SCardDisconnect(c->h, SCARD_LEAVE_CARD);
         free(c);
-        return -2;
+        return -3;                    /* card present, unsupported */
     }
     *out = c;
     return 0;
@@ -205,14 +232,89 @@ void iso7816_close(iso7816_source *c)
     free(c);
 }
 
+int iso7816_read_atr(const char *reader, char *out, size_t cap)
+{
+    if (!reader || !out || cap == 0) return -1;
+    out[0] = '\0';
+
+    SCARDHANDLE h;
+    DWORD       proto;
+    LONG rv = SCardConnect(g_ctx, reader, SCARD_SHARE_SHARED,
+                           SCARD_PROTOCOL_T0 | SCARD_PROTOCOL_T1,
+                           &h, &proto);
+    if (rv != SCARD_S_SUCCESS) return -1;
+
+    DWORD   state, atr_len = MAX_ATR_SIZE;
+    BYTE    atr[MAX_ATR_SIZE];
+    char    nm_buf[256];
+    DWORD   nm_len = sizeof nm_buf;
+    rv = SCardStatus(h, nm_buf, &nm_len, &state, &proto, atr, &atr_len);
+    SCardDisconnect(h, SCARD_LEAVE_CARD);
+    if (rv != SCARD_S_SUCCESS || atr_len == 0) return -1;
+
+    /* "XX " per byte except no trailing space, plus NUL → 3*N bytes. */
+    if ((size_t)atr_len * 3 > cap) return -1;
+
+    size_t off = 0;
+    for (DWORD i = 0; i < atr_len; i++) {
+        const char *sep = (i + 1 < atr_len) ? " " : "";
+        int n = snprintf(out + off, cap - off, "%02X%s", atr[i], sep);
+        if (n < 0 || (size_t)n >= cap - off) return -1;
+        off += (size_t)n;
+    }
+    return 0;
+}
+
 int iso7816_read(iso7816_source *c, uint8_t *buf, size_t n)
 {
     if (!c || (!buf && n)) return -1;
+
+    /* The card's accepted Le is unknown on the first call; we start at
+     * a power-of-two upper bound (max_chunk = 128) and halve on every
+     * SW != 9000 response until something works. The learned size is
+     * sticky on the source.
+     *
+     * Some cards (notably some national-ID cards) require a *fixed*
+     * Le rather than a maximum: GET CHALLENGE(8) is the only accepted
+     * form, and a tail less than max_chunk is rejected. We handle that
+     * by always issuing exactly max_chunk bytes — fetching into a
+     * stack scratch when the caller wants fewer — and discarding the
+     * over-shoot. The cost is at most max_chunk-1 extra random bytes
+     * per logical read; for an 8-byte fixed-Le card that's negligible.
+     *
+     * The discard is deliberate: over-fetched bytes are not preserved
+     * across reads. Carrying state forward would require another path
+     * for invalidating it on session close / rebind, and the savings
+     * are small enough not to be worth it. */
     while (n) {
-        size_t chunk = n > 255 ? 255 : n;
-        if (try_get_challenge(c, chunk, buf) <= 0) return -1;
-        buf += chunk;
-        n -= chunk;
+        if (c->max_chunk == 0) return -1;
+        size_t chunk = c->max_chunk;
+        int    truncating = (n < chunk);
+        uint8_t  scratch[256];
+        uint8_t *target = truncating ? scratch : buf;
+
+        int rv = try_get_challenge(c, chunk, target);
+        if (rv > 0) {
+            if (truncating) {
+                memcpy(buf, scratch, n);
+                buf += n;
+                n = 0;
+            } else {
+                buf += chunk;
+                n -= chunk;
+            }
+            continue;
+        }
+        if (rv != -2) return -1;        /* hard transport error */
+
+        /* SW != 9000 — halve max_chunk and retry on the next loop. */
+        if (c->max_chunk > 1) {
+            c->max_chunk /= 2;
+            LOGD("card refused GET CHALLENGE(%zu); narrowing chunk to %zu\n",
+                 chunk, c->max_chunk);
+            continue;
+        }
+        return -1;
     }
     return 0;
 }

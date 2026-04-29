@@ -42,9 +42,10 @@ void infnoise_free_devices(char **paths, size_t count)
     infnoise_free_paths(paths, count);
 }
 
-int infnoise_source_read_serial(const char *path, char *out, size_t cap)
+int infnoise_source_read_dev_info(const char *path,
+                                  struct infnoise_dev_info *out)
 {
-    return infnoise_read_serial(path, out, cap);
+    return infnoise_read_dev_info(path, out);
 }
 
 int infnoise_source_open(const char *path, infnoise_source **out)

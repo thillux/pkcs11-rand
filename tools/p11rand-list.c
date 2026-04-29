@@ -13,39 +13,52 @@
  *     handshake. SHARE_SHARED is intentional — a passing probe doesn't
  *     kick out other PKCS#11 consumers; "usable" means the card
  *     actually answers a GET CHALLENGE round.
- *   - infnoise: open the FT240X via raw USB and run setup_ftdi(). The
- *     kernel ftdi_sio driver, if bound, is auto-detached. We can't
- *     detect another userspace process holding the same device:
- *     USBDEVFS_CLAIMINTERFACE is only advisory between userspace
- *     processes (it only excludes kernel drivers). "usable" therefore
- *     means "this process can open and configure the device right
- *     now"; a seeder already running in another process does not flip
- *     the device's status.
+ *   - infnoise: try a non-blocking exclusive flock(2) on the usbfs fd
+ *     first; an EWOULDBLOCK means another infnoise-aware process is
+ *     currently holding the device — reported as "in-use" without
+ *     disturbing the live session. If the lock is free we drop it,
+ *     run the full open + setup_ftdi() probe, and report "usable" or
+ *     "unusable". Note: we depend on every consumer of the device
+ *     using the same flock convention (which infnoise-core enforces);
+ *     a foreign tool that bypasses the lock is invisible here.
  *
  * Usage:
- *     p11rand-list [-q]
+ *     p11rand-list [-q] [-v]
  *
  *       -q    machine-readable output: one tab-separated record per
  *             device (kind \t name \t status), no headings, no summary.
+ *       -v    verbose: enable the per-APDU / per-USB-transfer trace
+ *             from the iso7816 and infnoise source layers (equivalent
+ *             to setting P11RAND_DEBUG=1). Useful for diagnosing why
+ *             an inserted card is flagged unusable (e.g. unsupported
+ *             GET CHALLENGE, unrecognized applet).
  */
 
 #define _POSIX_C_SOURCE 200809L
+#define _DEFAULT_SOURCE       /* flock(2) */
 
+#include "../src/infnoise-core.h"     /* struct infnoise_dev_info */
 #include "../src/source_iso7816.h"
 #include "../src/source_infnoise.h"
 
+#include <errno.h>
+#include <fcntl.h>
 #include <getopt.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
+#include <sys/file.h>
 
 static int g_quiet;
 
 static void usage(const char *argv0)
 {
     fprintf(stderr,
-        "usage: %s [-q]\n"
-        "  -q    tab-separated output (kind\\tname\\tstatus); no headings\n",
+        "usage: %s [-q] [-v]\n"
+        "  -q    tab-separated output (kind\\tname\\tstatus); no headings\n"
+        "  -v    verbose: per-APDU / USB trace from the source layers\n"
+        "        (same effect as setting P11RAND_DEBUG=1 in the env)\n",
         argv0);
 }
 
@@ -68,9 +81,14 @@ static void emit(const char *kind, const char *name, const char *status,
 int main(int argc, char **argv)
 {
     int opt;
-    while ((opt = getopt(argc, argv, "qh")) != -1) {
+    while ((opt = getopt(argc, argv, "qvh")) != -1) {
         switch (opt) {
         case 'q': g_quiet = 1; break;
+        case 'v': /* The source layers (iso7816, infnoise) read the
+                   * env at global_init time. Setting it here, before
+                   * the init calls below, is enough. */
+                  setenv("P11RAND_DEBUG", "1", 1);
+                  break;
         case 'h': usage(argv[0]); return 0;
         default:  usage(argv[0]); return 2;
         }
@@ -90,19 +108,27 @@ int main(int argc, char **argv)
                 iso7816_source *src = NULL;
                 int rv = iso7816_open(readers[i], &src);
                 const char *status;
-                if (rv == 0) {
-                    status = "usable";
-                    iso_usable++;
-                    iso7816_close(src);
-                } else if (rv == -2) {
-                    /* No card, or card present but no applet supports
-                     * GET CHALLENGE — both render the slot unusable for
-                     * this RNG. */
-                    status = "unusable";
-                } else {
-                    status = "error";
+                switch (rv) {
+                case  0: status = "usable";      iso_usable++;
+                         iso7816_close(src); break;
+                case -2: status = "no-card";     break;
+                case -3: status = "unsupported"; break;
+                default: status = "error";       break;
                 }
-                emit("iso7816", readers[i], status, NULL);
+
+                /* Annotate every slot that actually has a card with
+                 * its ATR — gives the user something to grep against
+                 * an ATR database when a card is rejected as
+                 * unsupported, or just to label the slot at a glance. */
+                char extra[120] = "";
+                if (rv == 0 || rv == -3) {
+                    char atr[100];
+                    if (iso7816_read_atr(readers[i], atr, sizeof atr) == 0
+                        && atr[0]) {
+                        snprintf(extra, sizeof extra, "ATR=%s", atr);
+                    }
+                }
+                emit("iso7816", readers[i], status, extra);
             }
             iso7816_free_readers(readers, n);
         } else if (!g_quiet) {
@@ -124,26 +150,56 @@ int main(int argc, char **argv)
                 puts("infnoise (FT240X):");
             }
             for (size_t i = 0; i < n; i++) {
-                infnoise_source *src = NULL;
-                int rv = infnoise_source_open(paths[i], &src);
-                const char *status;
-                if (rv == 0) {
-                    status = "usable";
-                    inf_usable++;
-                    infnoise_source_close(src);
-                } else {
-                    /* No permission, transient busy, or hardware
-                     * misbehaving — we can't tell them apart cleanly. */
-                    status = "unusable";
+                /* Read iManufacturer / iProduct / iSerialNumber via
+                 * USBDEVFS_CONTROL on endpoint 0 — no interface claim,
+                 * safe alongside an active session. */
+                struct infnoise_dev_info info = { 0 };
+                char extra[256] = "";
+                if (infnoise_source_read_dev_info(paths[i], &info) == 0) {
+                    int n = 0;
+                    if (info.manufacturer[0])
+                        n += snprintf(extra + n, sizeof extra - n,
+                                      "%smfr=%s",
+                                      n ? ", " : "", info.manufacturer);
+                    if (info.product[0])
+                        n += snprintf(extra + n, sizeof extra - n,
+                                      "%sproduct=%s",
+                                      n ? ", " : "", info.product);
+                    if (info.serial[0])
+                        n += snprintf(extra + n, sizeof extra - n,
+                                      "%sserial=%s",
+                                      n ? ", " : "", info.serial);
                 }
 
-                char serial[64] = "";
-                char extra[80]  = "";
-                if (infnoise_source_read_serial(paths[i],
-                                                serial, sizeof serial) == 0
-                    && serial[0]) {
-                    snprintf(extra, sizeof extra, "serial=%s", serial);
+                /* Cheap flock-probe: if we can't take an exclusive
+                 * non-blocking lock on the device fd, another infnoise
+                 * consumer is currently holding it. Reported as
+                 * "in-use", and we deliberately skip the full
+                 * infnoise_source_open to avoid disturbing the active
+                 * session. */
+                const char *status;
+                int probe = open(paths[i], O_RDWR);
+                if (probe < 0) {
+                    status = "unusable";
+                } else if (flock(probe, LOCK_EX | LOCK_NB) < 0
+                           && errno == EWOULDBLOCK) {
+                    status = "in-use";
+                    close(probe);
+                } else {
+                    close(probe);   /* releases our test-lock */
+
+                    infnoise_source *src = NULL;
+                    if (infnoise_source_open(paths[i], &src) == 0) {
+                        status = "usable";
+                        inf_usable++;
+                        infnoise_source_close(src);
+                    } else {
+                        /* Permission, transient busy, or hardware
+                         * misbehaving — we don't try to distinguish. */
+                        status = "unusable";
+                    }
                 }
+
                 emit("infnoise", paths[i], status, extra);
             }
             infnoise_free_devices(paths, n);

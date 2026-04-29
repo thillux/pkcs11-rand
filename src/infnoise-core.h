@@ -36,12 +36,9 @@ infnoise_ctx *infnoise_new(void);
 void          infnoise_free(infnoise_ctx *c);
 
 /* Open the FT240X identified by `path` and configure it for synchronous
- * bit-bang. `path` may be NULL, meaning "first FT240X found on the bus".
- *
- *   Linux : usbfs node such as "/dev/bus/usb/001/004".
- *   BSDs  : ugen control endpoint such as "/dev/ugen0.00".
- *
- * Returns 0 on success, -1 on failure. */
+ * bit-bang. `path` is a Linux usbfs node such as "/dev/bus/usb/001/004",
+ * or NULL meaning "first FT240X found on the bus". Returns 0 on success,
+ * -1 on failure. */
 int  infnoise_open(infnoise_ctx *c, const char *path);
 
 /* Close the device. Safe to call when not open. */
@@ -61,12 +58,21 @@ ssize_t infnoise_read(infnoise_ctx *c, uint8_t *buf, size_t n);
 int  infnoise_list_paths(char ***paths, size_t *count);
 void infnoise_free_paths(char **paths, size_t count);
 
-/* Read the FT240X's USB iSerialNumber string descriptor at `path` into
- * `out` (NUL-terminated, up to cap-1 bytes). The device must be powered
- * but the call neither claims its interface nor disturbs an open
- * session. Returns 0 on success — `out` may still be empty if the
- * device does not expose a serial — or -1 on I/O / decode failure. */
-int  infnoise_read_serial(const char *path, char *out, size_t cap);
+/* USB string descriptors of an FT240X, ASCII-decoded. Empty fields on
+ * a device that exposes no descriptor at the corresponding index are
+ * still a successful return. */
+struct infnoise_dev_info {
+    char manufacturer[64];   /* iManufacturer */
+    char product[64];        /* iProduct */
+    char serial[64];         /* iSerialNumber */
+};
+
+/* Read iManufacturer / iProduct / iSerialNumber from the FT240X at
+ * `path`. The call uses standard USBDEVFS_CONTROL transfers on the
+ * device's default endpoint — no interface claim, no flock — so it is
+ * safe to run alongside an active session held by another process.
+ * Returns 0 on success, -1 on I/O / decode failure. */
+int  infnoise_read_dev_info(const char *path, struct infnoise_dev_info *out);
 
 #ifdef __cplusplus
 }

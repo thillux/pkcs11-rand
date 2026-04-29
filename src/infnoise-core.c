@@ -1,37 +1,32 @@
 /*
  * infnoise-core  --  read the Infinite Noise Multiplier USB TRNG without
- *                    libusb/libftdi. Talks directly to the FT240X over the
- *                    OS's raw-USB interface:
- *
- *   Linux    : /dev/bus/usb/<bus>/<dev>   (usbfs, USBDEVFS_* ioctls)
- *   OpenBSD  : /dev/ugenN.{00,01,02}      (ugen(4), USB_DO_REQUEST + read/write)
+ *                    libusb/libftdi. Talks directly to the FT240X via the
+ *                    Linux usbfs interface (/dev/bus/usb/<bus>/<dev>,
+ *                    USBDEVFS_* ioctls).
  *
  * Each raw comparator bit carries roughly 0.88 bits of entropy and is
  * correlated with its neighbours. This module emits the raw post-health-
  * check byte stream; entropy extraction (whitening, conditioning) is the
  * caller's responsibility. In this project the pool layer in src/rng.c
- * SHA3-256-chains across all sources, so the older internal SHA3-512
- * extractor is no longer compiled in here.
+ * SHA3-256-chains across all sources.
  *
  * Multiple independent FT240X devices can be driven concurrently: every
  * piece of per-device state lives in `struct infnoise_ctx`, and the only
  * process-wide knob is the logging destination.
  *
- * Permissions:
- *   Linux:
- *     - udev rule granting rw to the plugdev group, or run as root, e.g.
- *         SUBSYSTEM=="usb", ATTR{idVendor}=="0403", ATTR{idProduct}=="6015", \
- *             MODE="0660", GROUP="plugdev"
- *     - the ftdi_sio kernel driver, if bound, is auto-detached.
- *   OpenBSD:
- *     - /dev/ugenN.* must be rw for the user.
- *     - uftdi(4) must NOT claim the device — disable uftdi in config(8)
- *       or attach the device explicitly to ugen(4).
+ * Permissions: udev rule granting rw to the plugdev group, or run as
+ * root, e.g.
+ *     SUBSYSTEM=="usb", ATTR{idVendor}=="0403", ATTR{idProduct}=="6015", \
+ *         MODE="0660", GROUP="plugdev"
+ * The ftdi_sio kernel driver, if bound, is auto-detached on open.
  */
 
-#if defined(__linux__)
-# define _POSIX_C_SOURCE 200809L
+#if !defined(__linux__)
+# error "infnoise-core is Linux-only (uses usbfs ioctls)"
 #endif
+
+#define _POSIX_C_SOURCE 200809L
+#define _DEFAULT_SOURCE   /* flock(2) */
 
 #include "infnoise-core.h"
 
@@ -46,6 +41,7 @@
 #include <syslog.h>
 #include <time.h>
 #include <unistd.h>
+#include <sys/file.h>     /* flock */
 #include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -152,12 +148,7 @@ static void log_perror(const char *what) {
 /* --- Per-device context ------------------------------------------------- */
 
 struct infnoise_ctx {
-#if defined(__linux__)
-    int fd;
-#else
-    int ctl, in, out;
-#endif
-
+    int     fd;                         /* usbfs device fd, -1 when closed */
     bool    opened;
     char   *path;                       /* identifying device path, owned */
 
@@ -184,11 +175,7 @@ static void dev_close_fds(infnoise_ctx *c);
 infnoise_ctx *infnoise_new(void) {
     infnoise_ctx *c = calloc(1, sizeof(*c));
     if (!c) return NULL;
-#if defined(__linux__)
     c->fd = -1;
-#else
-    c->ctl = c->in = c->out = -1;
-#endif
     c->hc_prob = 1.0;
     return c;
 }
@@ -201,15 +188,13 @@ void infnoise_free(infnoise_ctx *c) {
     free(c);
 }
 
-/* --- Platform-specific I/O layer ---------------------------------------- */
+/* --- I/O layer (Linux usbfs) -------------------------------------------- */
 
 static int  dev_open_path(infnoise_ctx *c, const char *path);
 static int  dev_find_first(char *path_out, size_t cap);
 static int  dev_control(infnoise_ctx *c, uint8_t req, uint16_t val, uint16_t idx);
 static int  dev_bulk_out(infnoise_ctx *c, const uint8_t *buf, int len);
 static int  dev_bulk_in (infnoise_ctx *c, uint8_t *buf, int len);
-
-#if defined(__linux__)
 
 #include <dirent.h>
 #include <linux/usbdevice_fs.h>
@@ -321,6 +306,28 @@ static int dev_open_path(infnoise_ctx *c, const char *path) {
                 FTDI_VID, FT240X_PID, path);
         return -1;
     }
+
+    /* USBDEVFS_CLAIMINTERFACE alone does NOT enforce mutual exclusion
+     * between userspace consumers: a second process can blindly call
+     * USBDEVFS_DISCONNECT on the same interface, and the kernel will
+     * release whatever driver currently has it — including the first
+     * process's usbfs_driver claim — before the second one re-claims.
+     *
+     * To enforce userspace exclusion we take a non-blocking exclusive
+     * flock on the device fd. Any well-behaved infnoise consumer in
+     * the same process tree (or anywhere on the host) will see
+     * EWOULDBLOCK on the second attempt and back off without nuking
+     * the first claim. The lock is dropped automatically on close. */
+    if (flock(fd, LOCK_EX | LOCK_NB) < 0) {
+        if (errno == EWOULDBLOCK)
+            log_msg(LOG_INFO, "%s: locked by another infnoise process",
+                    path);
+        else
+            log_perror("flock");
+        close(fd);
+        return -1;
+    }
+
     struct usbdevfs_ioctl u = { .ifno = 0,
                                 .ioctl_code = USBDEVFS_DISCONNECT,
                                 .data = NULL };
@@ -378,51 +385,29 @@ static int dev_bulk_in(infnoise_ctx *c, uint8_t *buf, int len) {
     return linux_bulk(c, 0x81, buf, len);
 }
 
-int infnoise_read_serial(const char *path, char *out, size_t cap)
+/* Read string descriptor at index `idx` (1..255) from the device fd.
+ * The result is UTF-16 LE per USB spec; we drop the high byte and
+ * substitute '?' for any non-ASCII codepoint (FT240X strings are
+ * ASCII). Returns 0 on success (empty `out` is success when the
+ * device exposes no descriptor at that index), -1 on error. */
+static int read_string_at(int fd, uint8_t idx, char *out, size_t cap)
 {
-    if (!path || !out || cap == 0) return -1;
+    if (cap == 0) return -1;
     out[0] = '\0';
+    if (idx == 0) return 0;     /* device exposes no descriptor here */
 
-    int fd = open(path, O_RDWR);
-    if (fd < 0) return -1;
-
-    /* Pull the device descriptor via control transfer rather than the
-     * read(2) shortcut so a freshly-opened fd is in a known state. The
-     * descriptor's byte 16 is iSerialNumber: an index into the string
-     * descriptor table, or 0 if the device exposes no serial. */
-    uint8_t dd[18];
-    struct usbdevfs_ctrltransfer ct = {
-        .bRequestType = 0x80,            /* dev->host, standard, device */
-        .bRequest     = 0x06,            /* GET_DESCRIPTOR              */
-        .wValue       = (uint16_t)(0x01u << 8),  /* DEVICE, index 0     */
-        .wIndex       = 0,
-        .wLength      = sizeof dd,
-        .timeout      = 1000,
-        .data         = dd,
-    };
-    if (ioctl(fd, USBDEVFS_CONTROL, &ct) < 0) {
-        close(fd); return -1;
-    }
-    uint8_t i_serial = dd[16];
-    if (i_serial == 0) { close(fd); return 0; }   /* no serial exposed */
-
-    /* String descriptor: bLength byte, type byte (0x03), then UTF-16 LE.
-     * Request in US English (langid 0x0409); FT240X serials are ASCII
-     * so we just drop the high byte after a sanity check. */
     uint8_t buf[256];
-    ct = (struct usbdevfs_ctrltransfer){
-        .bRequestType = 0x80,
-        .bRequest     = 0x06,            /* GET_DESCRIPTOR */
-        .wValue       = (uint16_t)((0x03u << 8) | i_serial),  /* STRING */
-        .wIndex       = 0x0409,
+    struct usbdevfs_ctrltransfer ct = {
+        .bRequestType = 0x80,                            /* dev->host */
+        .bRequest     = 0x06,                            /* GET_DESCRIPTOR */
+        .wValue       = (uint16_t)((0x03u << 8) | idx),  /* STRING type */
+        .wIndex       = 0x0409,                          /* US English */
         .wLength      = sizeof buf,
         .timeout      = 1000,
         .data         = buf,
     };
     int n = ioctl(fd, USBDEVFS_CONTROL, &ct);
-    close(fd);
-    if (n < 2 || buf[0] < 2 || buf[0] > n || buf[1] != 0x03)
-        return -1;
+    if (n < 2 || buf[0] < 2 || buf[0] > n || buf[1] != 0x03) return -1;
 
     size_t out_i = 0;
     for (int i = 2; i + 1 < buf[0] && out_i + 1 < cap; i += 2) {
@@ -433,146 +418,44 @@ int infnoise_read_serial(const char *path, char *out, size_t cap)
     return 0;
 }
 
-#elif defined(__OpenBSD__) || defined(__NetBSD__) || defined(__FreeBSD__)
-
-#include <dev/usb/usb.h>
-
-int infnoise_list_paths(char ***paths_out, size_t *count_out) {
-    if (!paths_out || !count_out) return -1;
-    *paths_out = NULL;
-    *count_out = 0;
-    char  **arr = NULL;
-    size_t  cap = 0, n = 0;
-    for (int idx = 0; idx < 16; idx++) {
-        char p[32];
-        snprintf(p, sizeof p, "/dev/ugen%d.00", idx);
-        int fd = open(p, O_RDWR);
-        if (fd < 0) continue;
-        struct usb_device_info di;
-        int ok = ioctl(fd, USB_GET_DEVICEINFO, &di) == 0
-              && di.udi_vendorNo  == FTDI_VID
-              && di.udi_productNo == FT240X_PID;
-        close(fd);
-        if (!ok) continue;
-        if (n == cap) {
-            cap = cap ? cap * 2 : 4;
-            char **na = realloc(arr, cap * sizeof(*na));
-            if (!na) goto fail;
-            arr = na;
-        }
-        arr[n] = strdup(p);
-        if (!arr[n]) goto fail;
-        n++;
-    }
-    *paths_out = arr;
-    *count_out = n;
-    return 0;
-fail:
-    for (size_t i = 0; i < n; i++) free(arr[i]);
-    free(arr);
-    return -1;
-}
-
-static int dev_find_first(char *path_out, size_t cap) {
-    char **arr = NULL;
-    size_t n = 0;
-    if (infnoise_list_paths(&arr, &n) < 0 || n == 0) {
-        infnoise_free_paths(arr, n);
-        return -1;
-    }
-    snprintf(path_out, cap, "%s", arr[0]);
-    infnoise_free_paths(arr, n);
-    return 0;
-}
-
-static int dev_open_path(infnoise_ctx *c, const char *ctl_path) {
-    int ctl = open(ctl_path, O_RDWR);
-    if (ctl < 0) { log_perror(ctl_path); return -1; }
-    struct usb_device_info di;
-    if (ioctl(ctl, USB_GET_DEVICEINFO, &di) < 0
-        || di.udi_vendorNo  != FTDI_VID
-        || di.udi_productNo != FT240X_PID) {
-        log_msg(LOG_ERR, "no FT240X at %s", ctl_path);
-        close(ctl);
-        return -1;
-    }
-    char in_path[64], out_path[64];
-    size_t L = strlen(ctl_path);
-    if (L < 3 || strcmp(ctl_path + L - 3, ".00") != 0) {
-        log_msg(LOG_ERR, "expected ugenN.00 path, got %s", ctl_path);
-        close(ctl);
-        return -1;
-    }
-    snprintf(in_path,  sizeof in_path,  "%.*s.01", (int)(L - 3), ctl_path);
-    snprintf(out_path, sizeof out_path, "%.*s.02", (int)(L - 3), ctl_path);
-
-    int in  = open(in_path,  O_RDONLY);
-    int out = open(out_path, O_WRONLY);
-    if (in < 0 || out < 0) {
-        log_perror("ugenN.{01,02}");
-        if (in  >= 0) close(in);
-        if (out >= 0) close(out);
-        close(ctl);
-        return -1;
-    }
-    int ms = 2000, sh = 1;
-    (void)ioctl(ctl, USB_SET_TIMEOUT,    &ms);
-    (void)ioctl(in,  USB_SET_TIMEOUT,    &ms);
-    (void)ioctl(out, USB_SET_TIMEOUT,    &ms);
-    (void)ioctl(in,  USB_SET_SHORT_XFER, &sh);
-
-    c->ctl = ctl;
-    c->in  = in;
-    c->out = out;
-    log_msg(LOG_INFO, "opened FT240X at %s (vid=%04x pid=%04x)",
-            ctl_path, FTDI_VID, FT240X_PID);
-    return 0;
-}
-
-static void dev_close_fds(infnoise_ctx *c) {
-    if (c->in  >= 0) close(c->in);
-    if (c->out >= 0) close(c->out);
-    if (c->ctl >= 0) close(c->ctl);
-    c->in = c->out = c->ctl = -1;
-}
-
-static int dev_control(infnoise_ctx *c, uint8_t req, uint16_t val, uint16_t idx) {
-    struct usb_ctl_request r;
-    memset(&r, 0, sizeof r);
-    r.ucr_request.bmRequestType = 0x40;
-    r.ucr_request.bRequest      = req;
-    USETW(r.ucr_request.wValue,  val);
-    USETW(r.ucr_request.wIndex,  idx);
-    USETW(r.ucr_request.wLength, 0);
-    r.ucr_data  = NULL;
-    r.ucr_flags = 0;
-    return ioctl(c->ctl, USB_DO_REQUEST, &r);
-}
-
-static int dev_bulk_out(infnoise_ctx *c, const uint8_t *buf, int len) {
-    return (int)write(c->out, buf, (size_t)len);
-}
-static int dev_bulk_in(infnoise_ctx *c, uint8_t *buf, int len) {
-    return (int)read(c->in, buf, (size_t)len);
-}
-
-int infnoise_read_serial(const char *path, char *out, size_t cap)
+int infnoise_read_dev_info(const char *path, struct infnoise_dev_info *out)
 {
-    if (!path || !out || cap == 0) return -1;
-    out[0] = '\0';
-    int fd = open(path, O_RDONLY);
-    if (fd < 0) return -1;
-    struct usb_device_info di;
-    int rv = ioctl(fd, USB_GET_DEVICEINFO, &di);
-    close(fd);
-    if (rv < 0) return -1;
-    snprintf(out, cap, "%s", di.udi_serial);
-    return 0;
-}
+    if (!path || !out) return -1;
+    memset(out, 0, sizeof *out);
 
-#else
-# error "unsupported platform: need Linux or a BSD with ugen(4)"
-#endif
+    int fd = open(path, O_RDWR);
+    if (fd < 0) return -1;
+
+    /* Pull the device descriptor via control transfer rather than the
+     * read(2) shortcut so a freshly-opened fd is in a known state.
+     * Bytes 14 / 15 / 16 are iManufacturer / iProduct / iSerialNumber:
+     * each an index into the string-descriptor table, or 0 if the
+     * device exposes no string at that slot. */
+    uint8_t dd[18];
+    struct usbdevfs_ctrltransfer ct = {
+        .bRequestType = 0x80,
+        .bRequest     = 0x06,
+        .wValue       = (uint16_t)(0x01u << 8),  /* DEVICE descriptor */
+        .wIndex       = 0,
+        .wLength      = sizeof dd,
+        .timeout      = 1000,
+        .data         = dd,
+    };
+    if (ioctl(fd, USBDEVFS_CONTROL, &ct) < 0) {
+        close(fd); return -1;
+    }
+
+    int rv = 0;
+    if (read_string_at(fd, dd[14], out->manufacturer,
+                       sizeof out->manufacturer) < 0) rv = -1;
+    if (read_string_at(fd, dd[15], out->product,
+                       sizeof out->product)      < 0) rv = -1;
+    if (read_string_at(fd, dd[16], out->serial,
+                       sizeof out->serial)       < 0) rv = -1;
+
+    close(fd);
+    return rv;
+}
 
 void infnoise_free_paths(char **paths, size_t count) {
     if (!paths) return;

@@ -107,6 +107,13 @@ p11rand_seed = executable('p11rand-seed',
   install             : true,
 )
 
+p11rand_read = executable('p11rand-read',
+  sources             : ['tools/p11rand-read.c'],
+  include_directories : inc,
+  dependencies        : [dl_dep],
+  install             : true,
+)
+
 # p11rand-list always links both backends so it can inventory every
 # PC/SC reader and every FT240X regardless of the .so's pool config.
 p11rand_list = executable('p11rand-list',

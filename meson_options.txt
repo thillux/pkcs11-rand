@@ -1,0 +1,27 @@
+option('iso7816_cards',
+  type        : 'integer',
+  min         : 0,
+  value       : 1,
+  description : 'Number of smartcard slots in the RNG pool. Each slot binds to one PC/SC reader and feeds raw GET CHALLENGE bytes into the pool. Set to 0 to omit the iso7816 backend entirely.',
+)
+
+option('infnoise_devices',
+  type        : 'integer',
+  min         : 0,
+  value       : 0,
+  description : 'Number of Infinite Noise TRNG slots in the pool. Each slot drives one FT240X. Multiple devices run as fully independent contexts (no shared state in infnoise-core).',
+)
+
+option('iso7816_input_bytes',
+  type        : 'integer',
+  min         : 32,
+  value       : 32,
+  description : 'Bytes fetched per iso7816 source per output round. Must be a multiple of 32 (one SHA3-256 input block per fetch tick). Setting it >32 oversamples the card TRNG and forces the SHA3-256 post-processor on, even when N+M=1. The iso7816 backend chunks across APDUs internally, so values >255 are fine.',
+)
+
+option('infnoise_input_bytes',
+  type        : 'integer',
+  min         : 32,
+  value       : 32,
+  description : 'Bytes fetched per infnoise source per output round. Must be a multiple of 32. Setting it >32 oversamples the FT240X (raw comparator bits carry ~0.88 bits of entropy per bit) and forces the SHA3-256 post-processor on, even when N+M=1.',
+)

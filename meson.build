@@ -84,11 +84,27 @@ p11rand = shared_library('p11rand',
   soversion             : '0',
 )
 
+dl_dep = cc.find_library('dl', required : true)
+
 p11rand_test = executable('p11rand-test',
   sources             : ['test/p11rand-test.c'],
   include_directories : inc,
-  dependencies        : [cc.find_library('dl', required : true)],
+  dependencies        : [dl_dep],
   install             : false,
+)
+
+p11rand_wait = executable('p11rand-wait',
+  sources             : ['tools/p11rand-wait.c'],
+  include_directories : inc,
+  dependencies        : [dl_dep],
+  install             : true,
+)
+
+p11rand_seed = executable('p11rand-seed',
+  sources             : ['tools/p11rand-seed.c'],
+  include_directories : inc,
+  dependencies        : [dl_dep],
+  install             : true,
 )
 
 test('smoke', p11rand_test, args : [p11rand.full_path()])

@@ -378,6 +378,61 @@ static int dev_bulk_in(infnoise_ctx *c, uint8_t *buf, int len) {
     return linux_bulk(c, 0x81, buf, len);
 }
 
+int infnoise_read_serial(const char *path, char *out, size_t cap)
+{
+    if (!path || !out || cap == 0) return -1;
+    out[0] = '\0';
+
+    int fd = open(path, O_RDWR);
+    if (fd < 0) return -1;
+
+    /* Pull the device descriptor via control transfer rather than the
+     * read(2) shortcut so a freshly-opened fd is in a known state. The
+     * descriptor's byte 16 is iSerialNumber: an index into the string
+     * descriptor table, or 0 if the device exposes no serial. */
+    uint8_t dd[18];
+    struct usbdevfs_ctrltransfer ct = {
+        .bRequestType = 0x80,            /* dev->host, standard, device */
+        .bRequest     = 0x06,            /* GET_DESCRIPTOR              */
+        .wValue       = (uint16_t)(0x01u << 8),  /* DEVICE, index 0     */
+        .wIndex       = 0,
+        .wLength      = sizeof dd,
+        .timeout      = 1000,
+        .data         = dd,
+    };
+    if (ioctl(fd, USBDEVFS_CONTROL, &ct) < 0) {
+        close(fd); return -1;
+    }
+    uint8_t i_serial = dd[16];
+    if (i_serial == 0) { close(fd); return 0; }   /* no serial exposed */
+
+    /* String descriptor: bLength byte, type byte (0x03), then UTF-16 LE.
+     * Request in US English (langid 0x0409); FT240X serials are ASCII
+     * so we just drop the high byte after a sanity check. */
+    uint8_t buf[256];
+    ct = (struct usbdevfs_ctrltransfer){
+        .bRequestType = 0x80,
+        .bRequest     = 0x06,            /* GET_DESCRIPTOR */
+        .wValue       = (uint16_t)((0x03u << 8) | i_serial),  /* STRING */
+        .wIndex       = 0x0409,
+        .wLength      = sizeof buf,
+        .timeout      = 1000,
+        .data         = buf,
+    };
+    int n = ioctl(fd, USBDEVFS_CONTROL, &ct);
+    close(fd);
+    if (n < 2 || buf[0] < 2 || buf[0] > n || buf[1] != 0x03)
+        return -1;
+
+    size_t out_i = 0;
+    for (int i = 2; i + 1 < buf[0] && out_i + 1 < cap; i += 2) {
+        uint16_t cp = buf[i] | ((uint16_t)buf[i + 1] << 8);
+        out[out_i++] = (cp < 0x80) ? (char)cp : '?';
+    }
+    out[out_i] = '\0';
+    return 0;
+}
+
 #elif defined(__OpenBSD__) || defined(__NetBSD__) || defined(__FreeBSD__)
 
 #include <dev/usb/usb.h>
@@ -499,6 +554,20 @@ static int dev_bulk_out(infnoise_ctx *c, const uint8_t *buf, int len) {
 }
 static int dev_bulk_in(infnoise_ctx *c, uint8_t *buf, int len) {
     return (int)read(c->in, buf, (size_t)len);
+}
+
+int infnoise_read_serial(const char *path, char *out, size_t cap)
+{
+    if (!path || !out || cap == 0) return -1;
+    out[0] = '\0';
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return -1;
+    struct usb_device_info di;
+    int rv = ioctl(fd, USB_GET_DEVICEINFO, &di);
+    close(fd);
+    if (rv < 0) return -1;
+    snprintf(out, cap, "%s", di.udi_serial);
+    return 0;
 }
 
 #else

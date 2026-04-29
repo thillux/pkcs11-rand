@@ -61,6 +61,13 @@ ssize_t infnoise_read(infnoise_ctx *c, uint8_t *buf, size_t n);
 int  infnoise_list_paths(char ***paths, size_t *count);
 void infnoise_free_paths(char **paths, size_t count);
 
+/* Read the FT240X's USB iSerialNumber string descriptor at `path` into
+ * `out` (NUL-terminated, up to cap-1 bytes). The device must be powered
+ * but the call neither claims its interface nor disturbs an open
+ * session. Returns 0 on success — `out` may still be empty if the
+ * device does not expose a serial — or -1 on I/O / decode failure. */
+int  infnoise_read_serial(const char *path, char *out, size_t cap);
+
 #ifdef __cplusplus
 }
 #endif

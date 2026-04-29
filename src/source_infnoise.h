@@ -25,6 +25,11 @@ void infnoise_global_shutdown(void);
 int  infnoise_list_devices(char ***paths, size_t *count);
 void infnoise_free_devices(char **paths, size_t count);
 
+/* Read the FT240X iSerialNumber string into `out` (NUL-terminated, up
+ * to cap-1 bytes). Empty `out` on a device without a serial is still
+ * a successful return. Returns 0 on success, -1 on I/O failure. */
+int  infnoise_source_read_serial(const char *path, char *out, size_t cap);
+
 /* Open a specific FT240X by path (Linux usbfs node or BSD ugen control
  * endpoint). Returns 0 on success, -2 if absent / not usable, -1 on
  * resource error. */

@@ -107,4 +107,22 @@ p11rand_seed = executable('p11rand-seed',
   install             : true,
 )
 
+# p11rand-list always links both backends so it can inventory every
+# PC/SC reader and every FT240X regardless of the .so's pool config.
+p11rand_list = executable('p11rand-list',
+  sources             : [
+    'tools/p11rand-list.c',
+    'src/source_iso7816.c',
+    'src/source_infnoise.c',
+    'src/infnoise-core.c',
+  ],
+  include_directories : inc,
+  dependencies        : [
+    dependency('libpcsclite', required : true),
+    dependency('threads'),
+  ],
+  c_args              : ['-D_POSIX_C_SOURCE=200809L'],
+  install             : true,
+)
+
 test('smoke', p11rand_test, args : [p11rand.full_path()])

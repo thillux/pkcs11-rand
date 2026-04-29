@@ -19,9 +19,13 @@
           src = self;
 
           nativeBuildInputs = with pkgs; [ meson ninja pkg-config ];
+          # pcsclite is always required: the p11rand-list helper links
+          # both backends regardless of pool config so it can inventory
+          # every smartcard reader on the host.
+          # libcrypto is pulled in only when the pool's SHA3-256 chain
+          # is active (n+m>1).
           buildInputs =
-            pkgs.lib.optionals (n > 0) [ pkgs.pcsclite ]
-            # libcrypto: needed only by the pool's SHA3-256 chain when n+m>1.
+            [ pkgs.pcsclite ]
             ++ pkgs.lib.optionals ((n + m) > 1) [ pkgs.openssl ];
 
           mesonFlags = [

@@ -9,7 +9,7 @@ option('infnoise_devices',
   type        : 'integer',
   min         : 0,
   value       : 0,
-  description : 'Number of Infinite Noise TRNG slots in the pool. Each slot drives one FT240X. Multiple devices run as fully independent contexts (no shared state in infnoise-core).',
+  description : 'Number of Infinite Noise TRNG slots in the pool. Each slot reads from one /dev/infnoiseN character device exposed by the in-kernel driver. Multiple devices run as fully independent contexts (no shared state in infnoise-core).',
 )
 
 option('iso7816_input_bytes',
@@ -23,5 +23,5 @@ option('infnoise_input_bytes',
   type        : 'integer',
   min         : 32,
   value       : 32,
-  description : 'Bytes fetched per infnoise source per output round. Must be a multiple of 32. Setting it >32 oversamples the FT240X (raw comparator bits carry ~0.88 bits of entropy per bit) and forces the SHA3-256 post-processor on, even when N+M=1.',
+  description : 'Bytes fetched per infnoise source per output round. Must be a multiple of 32. Setting it >32 pulls extra bytes from /dev/infnoiseN per round and forces the SHA3-256 post-processor on, even when N+M=1.',
 )

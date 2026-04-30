@@ -1,8 +1,7 @@
-/* Infinite Noise TRNG source: thin per-device wrapper around the now-
- * reentrant infnoise-core. Each open() consumes one path from the list
- * returned by infnoise_list_devices() and produces an independent context
- * that drives that single FT240X. Multiple sources may run in parallel
- * because they no longer share any global state. */
+/* Infinite Noise TRNG source: thin per-device wrapper around the
+ * reentrant infnoise-core. Each open() consumes one /dev/infnoiseN path
+ * from the list returned by infnoise_list_devices() and produces an
+ * independent context that reads from that single kernel node. */
 
 #define _POSIX_C_SOURCE 200809L
 #include "source_infnoise.h"
@@ -40,12 +39,6 @@ int infnoise_list_devices(char ***paths_out, size_t *count_out)
 void infnoise_free_devices(char **paths, size_t count)
 {
     infnoise_free_paths(paths, count);
-}
-
-int infnoise_source_read_dev_info(const char *path,
-                                  struct infnoise_dev_info *out)
-{
-    return infnoise_read_dev_info(path, out);
 }
 
 int infnoise_source_open(const char *path, infnoise_source **out)

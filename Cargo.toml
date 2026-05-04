@@ -1,0 +1,27 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/p11rand-core",
+    "crates/p11rand",
+    "crates/p11rand-tools",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+rust-version = "1.74"
+
+[workspace.dependencies]
+p11rand-core = { path = "crates/p11rand-core" }
+pcsc        = "2.9"
+sha3        = "0.11"
+libc        = "0.2"
+cryptoki-sys = "0.5"
+libloading  = "0.9"
+nix         = { version = "0.31", default-features = false, features = ["ioctl", "fs", "signal", "time"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

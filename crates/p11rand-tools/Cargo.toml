@@ -1,0 +1,37 @@
+[package]
+name        = "p11rand-tools"
+version     = { workspace = true }
+edition     = { workspace = true }
+license     = { workspace = true }
+description = "CLI tools (list / read / seed / wait / test) for the p11rand PKCS#11 module"
+
+[lib]
+name = "p11rand_tools"
+path = "src/lib.rs"
+
+[[bin]]
+name = "p11rand-list"
+path = "src/bin/p11rand-list.rs"
+
+[[bin]]
+name = "p11rand-read"
+path = "src/bin/p11rand-read.rs"
+
+[[bin]]
+name = "p11rand-seed"
+path = "src/bin/p11rand-seed.rs"
+
+[[bin]]
+name = "p11rand-wait"
+path = "src/bin/p11rand-wait.rs"
+
+[[bin]]
+name = "p11rand-test"
+path = "src/bin/p11rand-test.rs"
+
+[dependencies]
+p11rand-core = { workspace = true }
+cryptoki-sys = { workspace = true }
+libloading   = { workspace = true }
+libc         = { workspace = true }
+nix          = { workspace = true }

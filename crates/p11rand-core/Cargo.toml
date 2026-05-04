@@ -1,0 +1,11 @@
+[package]
+name        = "p11rand-core"
+version     = { workspace = true }
+edition     = { workspace = true }
+license     = { workspace = true }
+description = "RNG sources (iso7816 GET CHALLENGE + Infinite Noise) and pooling layer"
+
+[dependencies]
+pcsc  = { workspace = true }
+sha3  = { workspace = true }
+libc  = { workspace = true }

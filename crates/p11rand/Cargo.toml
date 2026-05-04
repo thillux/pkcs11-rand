@@ -1,0 +1,17 @@
+[package]
+name        = "p11rand"
+version     = { workspace = true }
+edition     = { workspace = true }
+license     = { workspace = true }
+description = "PKCS#11 v2.40 RNG-only provider backed by the p11rand-core pool"
+
+[lib]
+name       = "p11rand"
+crate-type = ["cdylib"]
+
+[dependencies]
+p11rand-core = { workspace = true }
+cryptoki-sys = { workspace = true }
+libc         = { workspace = true }
+
+[build-dependencies]

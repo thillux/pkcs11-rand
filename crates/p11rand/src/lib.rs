@@ -1,8 +1,20 @@
-//! PKCS#11 v2.40 RNG-only provider.
+//! PKCS#11 v2.40 / v3.1 RNG-only provider.
 //!
-//! One slot per RNG-pool view is published at `C_Initialize` time.
-//! `C_GenerateRandom` is the only crypto entrypoint backed by real device
-//! work; everything else is bookkeeping or [`CKR_FUNCTION_NOT_SUPPORTED`].
+//! One slot per RNG-pool view is published at `C_Initialize` time. The token
+//! announces RNG support to applications via the `CKF_RNG` token-info flag
+//! (set unconditionally in `C_GetTokenInfo`); `C_GenerateRandom` is the only
+//! crypto entrypoint backed by real device work and the only thing the token
+//! claims to do. Everything else is bookkeeping or
+//! [`CKR_FUNCTION_NOT_SUPPORTED`]. PKCS#11 has no standard `CKM_*` for the
+//! RNG, so `C_GetMechanismList` is intentionally empty — `CKF_RNG` is the
+//! sole, canonical advertisement.
+//!
+//! The module exposes two interfaces via the v3 discovery API
+//! (`C_GetInterfaceList` / `C_GetInterface`):
+//!   - `"PKCS 11"` v3.1 — the modern interface, backed by
+//!     [`CK_FUNCTION_LIST_3_0`] (the 3.x ABI; 3.1 adds no new entries).
+//!   - `"PKCS 11"` v2.40 — the legacy interface, backed by
+//!     [`CK_FUNCTION_LIST`], identical to what `C_GetFunctionList` returns.
 //!
 //! Threading: spec compliance against concurrent calls from app threads is
 //! provided by a single global mutex around all state mutations, including
@@ -10,6 +22,8 @@
 
 #![allow(non_upper_case_globals, non_snake_case, non_camel_case_types)]
 
+use std::ffi::{c_void, CStr};
+use std::os::raw::c_char;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use cryptoki_sys::*;
@@ -178,8 +192,10 @@ unsafe extern "C" fn C_GetInfo(p_info: CK_INFO_PTR) -> CK_RV {
         }
     }
     let info = unsafe { &mut *p_info };
+    // Advertise 3.1 as the highest spec we implement. The v2.40 ABI is still
+    // discoverable via C_GetFunctionList / the "PKCS 11" v2.40 interface.
     *info = CK_INFO {
-        cryptokiVersion: CK_VERSION { major: 2, minor: 40 },
+        cryptokiVersion: CK_VERSION { major: 3, minor: 1 },
         manufacturerID: [0; 32],
         flags: 0,
         libraryDescription: [0; 32],
@@ -294,6 +310,9 @@ unsafe extern "C" fn C_GetTokenInfo(slot: CK_SLOT_ID, p_info: CK_TOKEN_INFO_PTR)
     drop(m);
 
     let info = unsafe { &mut *p_info };
+    // CKF_RNG is the canonical PKCS#11 way to announce that this token has
+    // a usable RNG (i.e. C_GenerateRandom returns real entropy). It is the
+    // single most important capability bit this module sets.
     *info = CK_TOKEN_INFO {
         label: [0; 32],
         manufacturerID: [0; 32],
@@ -643,6 +662,212 @@ stub!(C_GetFunctionStatus(_h: CK_SESSION_HANDLE));
 stub!(C_CancelFunction(_h: CK_SESSION_HANDLE));
 
 // ---------------------------------------------------------------------------
+// PKCS#11 3.x stubs
+// ---------------------------------------------------------------------------
+
+stub!(C_LoginUser(
+    _h: CK_SESSION_HANDLE, _t: CK_USER_TYPE,
+    _pin: CK_UTF8CHAR_PTR, _pl: CK_ULONG,
+    _u: CK_UTF8CHAR_PTR, _ul: CK_ULONG
+));
+stub!(C_SessionCancel(_h: CK_SESSION_HANDLE, _f: CK_FLAGS));
+stub!(C_MessageEncryptInit(
+    _h: CK_SESSION_HANDLE, _m: CK_MECHANISM_PTR, _o: CK_OBJECT_HANDLE
+));
+stub!(C_EncryptMessage(
+    _h: CK_SESSION_HANDLE, _p: CK_VOID_PTR, _pl: CK_ULONG,
+    _aad: CK_BYTE_PTR, _aadl: CK_ULONG,
+    _i: CK_BYTE_PTR, _il: CK_ULONG,
+    _o: CK_BYTE_PTR, _ol: CK_ULONG_PTR
+));
+stub!(C_EncryptMessageBegin(
+    _h: CK_SESSION_HANDLE, _p: CK_VOID_PTR, _pl: CK_ULONG,
+    _aad: CK_BYTE_PTR, _aadl: CK_ULONG
+));
+stub!(C_EncryptMessageNext(
+    _h: CK_SESSION_HANDLE, _p: CK_VOID_PTR, _pl: CK_ULONG,
+    _i: CK_BYTE_PTR, _il: CK_ULONG,
+    _o: CK_BYTE_PTR, _ol: CK_ULONG_PTR, _f: CK_FLAGS
+));
+stub!(C_MessageEncryptFinal(_h: CK_SESSION_HANDLE));
+stub!(C_MessageDecryptInit(
+    _h: CK_SESSION_HANDLE, _m: CK_MECHANISM_PTR, _o: CK_OBJECT_HANDLE
+));
+stub!(C_DecryptMessage(
+    _h: CK_SESSION_HANDLE, _p: CK_VOID_PTR, _pl: CK_ULONG,
+    _aad: CK_BYTE_PTR, _aadl: CK_ULONG,
+    _i: CK_BYTE_PTR, _il: CK_ULONG,
+    _o: CK_BYTE_PTR, _ol: CK_ULONG_PTR
+));
+stub!(C_DecryptMessageBegin(
+    _h: CK_SESSION_HANDLE, _p: CK_VOID_PTR, _pl: CK_ULONG,
+    _aad: CK_BYTE_PTR, _aadl: CK_ULONG
+));
+stub!(C_DecryptMessageNext(
+    _h: CK_SESSION_HANDLE, _p: CK_VOID_PTR, _pl: CK_ULONG,
+    _i: CK_BYTE_PTR, _il: CK_ULONG,
+    _o: CK_BYTE_PTR, _ol: CK_ULONG_PTR, _f: CK_FLAGS
+));
+stub!(C_MessageDecryptFinal(_h: CK_SESSION_HANDLE));
+stub!(C_MessageSignInit(
+    _h: CK_SESSION_HANDLE, _m: CK_MECHANISM_PTR, _o: CK_OBJECT_HANDLE
+));
+stub!(C_SignMessage(
+    _h: CK_SESSION_HANDLE, _p: CK_VOID_PTR, _pl: CK_ULONG,
+    _i: CK_BYTE_PTR, _il: CK_ULONG, _o: CK_BYTE_PTR, _ol: CK_ULONG_PTR
+));
+stub!(C_SignMessageBegin(_h: CK_SESSION_HANDLE, _p: CK_VOID_PTR, _pl: CK_ULONG));
+stub!(C_SignMessageNext(
+    _h: CK_SESSION_HANDLE, _p: CK_VOID_PTR, _pl: CK_ULONG,
+    _i: CK_BYTE_PTR, _il: CK_ULONG, _o: CK_BYTE_PTR, _ol: CK_ULONG_PTR
+));
+stub!(C_MessageSignFinal(_h: CK_SESSION_HANDLE));
+stub!(C_MessageVerifyInit(
+    _h: CK_SESSION_HANDLE, _m: CK_MECHANISM_PTR, _o: CK_OBJECT_HANDLE
+));
+stub!(C_VerifyMessage(
+    _h: CK_SESSION_HANDLE, _p: CK_VOID_PTR, _pl: CK_ULONG,
+    _i: CK_BYTE_PTR, _il: CK_ULONG, _s: CK_BYTE_PTR, _sl: CK_ULONG
+));
+stub!(C_VerifyMessageBegin(_h: CK_SESSION_HANDLE, _p: CK_VOID_PTR, _pl: CK_ULONG));
+stub!(C_VerifyMessageNext(
+    _h: CK_SESSION_HANDLE, _p: CK_VOID_PTR, _pl: CK_ULONG,
+    _i: CK_BYTE_PTR, _il: CK_ULONG, _s: CK_BYTE_PTR, _sl: CK_ULONG
+));
+stub!(C_MessageVerifyFinal(_h: CK_SESSION_HANDLE));
+
+// ---------------------------------------------------------------------------
+// PKCS#11 3.x interface discovery
+// ---------------------------------------------------------------------------
+//
+// `C_GetInterfaceList` and `C_GetInterface` are the v3 entry points apps use
+// to find a function list that matches a specific spec version. We publish
+// two interfaces, both named "PKCS 11":
+//   - { major: 3, minor: 1 } → CK_FUNCTION_LIST_3_0 (FN_LIST_3)
+//   - { major: 2, minor: 40 } → CK_FUNCTION_LIST     (FN_LIST)
+// The 3.1 entry is the default (returned when the caller passes a NULL name).
+
+const IFACE_NAME_PKCS11: &[u8; 8] = b"PKCS 11\0";
+
+#[repr(transparent)]
+struct Interfaces([CK_INTERFACE; 2]);
+// SAFETY: each pointer in INTERFACES targets a 'static immutable item that
+// callers must treat as read-only per the PKCS#11 contract.
+unsafe impl Sync for Interfaces {}
+
+static INTERFACES: Interfaces = Interfaces([
+    CK_INTERFACE {
+        pInterfaceName: IFACE_NAME_PKCS11.as_ptr() as *mut CK_UTF8CHAR,
+        pFunctionList: &FN_LIST_3 as *const CK_FUNCTION_LIST_3_0 as *mut c_void,
+        flags: 0,
+    },
+    CK_INTERFACE {
+        pInterfaceName: IFACE_NAME_PKCS11.as_ptr() as *mut CK_UTF8CHAR,
+        pFunctionList: &FN_LIST as *const CK_FUNCTION_LIST as *mut c_void,
+        flags: 0,
+    },
+]);
+
+fn iface_version(i: usize) -> CK_VERSION {
+    match i {
+        0 => FN_LIST_3.version,
+        1 => FN_LIST.version,
+        _ => CK_VERSION { major: 0, minor: 0 },
+    }
+}
+
+/// PKCS#11 3.0+ direct entry point. Returns the list of supported interfaces.
+/// Both a function-list field (in [`FN_LIST_3`]) and a direct dlsym-able
+/// symbol — the spec requires the symbol form be discoverable before the
+/// caller has any function list at all.
+///
+/// # Safety
+///
+/// `p_count` must be a writable pointer to a `CK_ULONG`. `p_list` is either
+/// NULL (size query) or a writable buffer of at least `*p_count` `CK_INTERFACE`
+/// entries.
+#[no_mangle]
+pub unsafe extern "C" fn C_GetInterfaceList(
+    p_list: CK_INTERFACE_PTR,
+    p_count: CK_ULONG_PTR,
+) -> CK_RV {
+    if p_count.is_null() {
+        return CKR_ARGUMENTS_BAD;
+    }
+    let n = INTERFACES.0.len();
+    let count = unsafe { &mut *p_count };
+    if p_list.is_null() {
+        *count = n as CK_ULONG;
+        return CKR_OK;
+    }
+    if (*count as usize) < n {
+        *count = n as CK_ULONG;
+        return CKR_BUFFER_TOO_SMALL;
+    }
+    for (i, e) in INTERFACES.0.iter().enumerate() {
+        unsafe { *p_list.add(i) = *e };
+    }
+    *count = n as CK_ULONG;
+    CKR_OK
+}
+
+/// PKCS#11 3.0+ direct entry point. Resolves a named interface to a function
+/// list. When `p_name` is NULL, returns the default (highest version) interface.
+///
+/// # Safety
+///
+/// `pp_iface` must be a writable pointer to a `CK_INTERFACE_PTR`. `p_name`,
+/// when non-null, must point to a NUL-terminated UTF-8 string; `p_version`,
+/// when non-null, must point to a readable `CK_VERSION`.
+#[no_mangle]
+pub unsafe extern "C" fn C_GetInterface(
+    p_name: CK_UTF8CHAR_PTR,
+    p_version: CK_VERSION_PTR,
+    pp_iface: CK_INTERFACE_PTR_PTR,
+    flags: CK_FLAGS,
+) -> CK_RV {
+    if pp_iface.is_null() {
+        return CKR_ARGUMENTS_BAD;
+    }
+    let want_name: Option<&[u8]> = if p_name.is_null() {
+        None
+    } else {
+        // SAFETY: the spec requires p_name to be a valid C string when non-null.
+        let cstr = unsafe { CStr::from_ptr(p_name as *const c_char) };
+        Some(cstr.to_bytes())
+    };
+    let want_version: Option<CK_VERSION> = if p_version.is_null() {
+        None
+    } else {
+        Some(unsafe { *p_version })
+    };
+
+    for (i, ent) in INTERFACES.0.iter().enumerate() {
+        if let Some(w) = want_name {
+            // The published name is NUL-terminated; compare without the NUL.
+            let nm = &IFACE_NAME_PKCS11[..IFACE_NAME_PKCS11.len() - 1];
+            if w != nm {
+                continue;
+            }
+        }
+        if let Some(v) = want_version {
+            let iv = iface_version(i);
+            if v.major != iv.major || v.minor != iv.minor {
+                continue;
+            }
+        }
+        if (ent.flags & flags) != flags {
+            continue;
+        }
+        unsafe {
+            *pp_iface = ent as *const CK_INTERFACE as *mut CK_INTERFACE;
+        }
+        return CKR_OK;
+    }
+    CKR_FUNCTION_FAILED
+}
+
+// ---------------------------------------------------------------------------
 // Function list
 // ---------------------------------------------------------------------------
 
@@ -718,6 +943,106 @@ static FN_LIST: CK_FUNCTION_LIST = CK_FUNCTION_LIST {
     C_WaitForSlotEvent: Some(C_WaitForSlotEvent),
 };
 
+// PKCS#11 3.x function list. Backs the "PKCS 11" v3.1 interface. The struct
+// shape is the 3.0 ABI; 3.1 added clarifications but no new functions, so the
+// version field carries 3.1 while every entry past `C_WaitForSlotEvent` that
+// we don't actually implement points at a `CKR_FUNCTION_NOT_SUPPORTED` stub.
+static FN_LIST_3: CK_FUNCTION_LIST_3_0 = CK_FUNCTION_LIST_3_0 {
+    version: CK_VERSION { major: 3, minor: 1 },
+    C_Initialize: Some(C_Initialize),
+    C_Finalize: Some(C_Finalize),
+    C_GetInfo: Some(C_GetInfo),
+    C_GetFunctionList: Some(C_GetFunctionList),
+    C_GetSlotList: Some(C_GetSlotList),
+    C_GetSlotInfo: Some(C_GetSlotInfo),
+    C_GetTokenInfo: Some(C_GetTokenInfo),
+    C_GetMechanismList: Some(C_GetMechanismList),
+    C_GetMechanismInfo: Some(C_GetMechanismInfo),
+    C_InitToken: Some(C_InitToken),
+    C_InitPIN: Some(C_InitPIN),
+    C_SetPIN: Some(C_SetPIN),
+    C_OpenSession: Some(C_OpenSession),
+    C_CloseSession: Some(C_CloseSession),
+    C_CloseAllSessions: Some(C_CloseAllSessions),
+    C_GetSessionInfo: Some(C_GetSessionInfo),
+    C_GetOperationState: Some(C_GetOperationState),
+    C_SetOperationState: Some(C_SetOperationState),
+    C_Login: Some(C_Login),
+    C_Logout: Some(C_Logout),
+    C_CreateObject: Some(C_CreateObject),
+    C_CopyObject: Some(C_CopyObject),
+    C_DestroyObject: Some(C_DestroyObject),
+    C_GetObjectSize: Some(C_GetObjectSize),
+    C_GetAttributeValue: Some(C_GetAttributeValue),
+    C_SetAttributeValue: Some(C_SetAttributeValue),
+    C_FindObjectsInit: Some(C_FindObjectsInit),
+    C_FindObjects: Some(C_FindObjects),
+    C_FindObjectsFinal: Some(C_FindObjectsFinal),
+    C_EncryptInit: Some(C_EncryptInit),
+    C_Encrypt: Some(C_Encrypt),
+    C_EncryptUpdate: Some(C_EncryptUpdate),
+    C_EncryptFinal: Some(C_EncryptFinal),
+    C_DecryptInit: Some(C_DecryptInit),
+    C_Decrypt: Some(C_Decrypt),
+    C_DecryptUpdate: Some(C_DecryptUpdate),
+    C_DecryptFinal: Some(C_DecryptFinal),
+    C_DigestInit: Some(C_DigestInit),
+    C_Digest: Some(C_Digest),
+    C_DigestUpdate: Some(C_DigestUpdate),
+    C_DigestKey: Some(C_DigestKey),
+    C_DigestFinal: Some(C_DigestFinal),
+    C_SignInit: Some(C_SignInit),
+    C_Sign: Some(C_Sign),
+    C_SignUpdate: Some(C_SignUpdate),
+    C_SignFinal: Some(C_SignFinal),
+    C_SignRecoverInit: Some(C_SignRecoverInit),
+    C_SignRecover: Some(C_SignRecover),
+    C_VerifyInit: Some(C_VerifyInit),
+    C_Verify: Some(C_Verify),
+    C_VerifyUpdate: Some(C_VerifyUpdate),
+    C_VerifyFinal: Some(C_VerifyFinal),
+    C_VerifyRecoverInit: Some(C_VerifyRecoverInit),
+    C_VerifyRecover: Some(C_VerifyRecover),
+    C_DigestEncryptUpdate: Some(C_DigestEncryptUpdate),
+    C_DecryptDigestUpdate: Some(C_DecryptDigestUpdate),
+    C_SignEncryptUpdate: Some(C_SignEncryptUpdate),
+    C_DecryptVerifyUpdate: Some(C_DecryptVerifyUpdate),
+    C_GenerateKey: Some(C_GenerateKey),
+    C_GenerateKeyPair: Some(C_GenerateKeyPair),
+    C_WrapKey: Some(C_WrapKey),
+    C_UnwrapKey: Some(C_UnwrapKey),
+    C_DeriveKey: Some(C_DeriveKey),
+    C_SeedRandom: Some(C_SeedRandom),
+    C_GenerateRandom: Some(C_GenerateRandom),
+    C_GetFunctionStatus: Some(C_GetFunctionStatus),
+    C_CancelFunction: Some(C_CancelFunction),
+    C_WaitForSlotEvent: Some(C_WaitForSlotEvent),
+    C_GetInterfaceList: Some(C_GetInterfaceList),
+    C_GetInterface: Some(C_GetInterface),
+    C_LoginUser: Some(C_LoginUser),
+    C_SessionCancel: Some(C_SessionCancel),
+    C_MessageEncryptInit: Some(C_MessageEncryptInit),
+    C_EncryptMessage: Some(C_EncryptMessage),
+    C_EncryptMessageBegin: Some(C_EncryptMessageBegin),
+    C_EncryptMessageNext: Some(C_EncryptMessageNext),
+    C_MessageEncryptFinal: Some(C_MessageEncryptFinal),
+    C_MessageDecryptInit: Some(C_MessageDecryptInit),
+    C_DecryptMessage: Some(C_DecryptMessage),
+    C_DecryptMessageBegin: Some(C_DecryptMessageBegin),
+    C_DecryptMessageNext: Some(C_DecryptMessageNext),
+    C_MessageDecryptFinal: Some(C_MessageDecryptFinal),
+    C_MessageSignInit: Some(C_MessageSignInit),
+    C_SignMessage: Some(C_SignMessage),
+    C_SignMessageBegin: Some(C_SignMessageBegin),
+    C_SignMessageNext: Some(C_SignMessageNext),
+    C_MessageSignFinal: Some(C_MessageSignFinal),
+    C_MessageVerifyInit: Some(C_MessageVerifyInit),
+    C_VerifyMessage: Some(C_VerifyMessage),
+    C_VerifyMessageBegin: Some(C_VerifyMessageBegin),
+    C_VerifyMessageNext: Some(C_VerifyMessageNext),
+    C_MessageVerifyFinal: Some(C_MessageVerifyFinal),
+};
+
 /// The one symbol every PKCS#11 consumer resolves via dlsym. Safe to call
 /// before `C_Initialize`.
 ///
@@ -737,4 +1062,5 @@ pub unsafe extern "C" fn C_GetFunctionList(pp_list: CK_FUNCTION_LIST_PTR_PTR) ->
     }
     CKR_OK
 }
+
 
